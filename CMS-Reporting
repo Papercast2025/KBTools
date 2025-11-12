@@ -1,0 +1,109 @@
+import streamlit as st
+import requests
+import pandas as pd
+import time
+import altair as alt
+from typing import List, Dict, Optional
+
+# ----------------------------
+# CONFIGURATION & SECRETS
+# ----------------------------
+CMS_INSTANCES = st.secrets["cms"]  # Loaded as a list of dicts
+
+DEFAULT_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Content-Type": "application/json;charset=UTF-8",
+    "User-Agent": "Mozilla/5.0"
+}
+
+# ----------------------------
+# SESSION LOGIN
+# ----------------------------
+def get_session_token(base_url: str, username: str, password: str) -> Optional[str]:
+    login_url = f"{base_url}/rest/authentication/login"
+    payload = {"username": username, "password": password}
+    try:
+        response = requests.post(login_url, json=payload, headers=DEFAULT_HEADERS, timeout=10)
+        response.raise_for_status()
+        cookies = response.cookies
+        return cookies.get("JSESSIONID")
+    except Exception as e:
+        return None
+
+# ----------------------------
+# DISPLAY MONITOR FETCH
+# ----------------------------
+def fetch_monitor_data(base_url: str, session_token: str) -> pd.DataFrame:
+    url = f"{base_url}/rest/monitor/load"
+    headers = DEFAULT_HEADERS.copy()
+    headers["Cookie"] = f"JSESSIONID={session_token}"
+
+    try:
+        response = requests.post(url, headers=headers, json={"index": -1, "count": 2147483647}, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return pd.DataFrame(data.get("displays", []))
+    except Exception as e:
+        return pd.DataFrame([{"error": str(e)}])
+
+# ----------------------------
+# STREAMLIT UI
+# ----------------------------
+st.set_page_config(page_title="CMS Monitor Dashboard", layout="wide")
+st.title("CMS Device Health Monitor (via Login)")
+
+summary_rows = []
+
+for cms in CMS_INSTANCES:
+    st.subheader(f"🔍 Raw data from {cms['name']}")
+
+    # Step 1: Login to get session
+    session_token = get_session_token(cms["url"], cms["username"], cms["password"])
+
+    if not session_token:
+        st.error(f"{cms['url']} - Failed to log in or get session token.")
+        continue
+
+    # Step 2: Fetch monitor data
+    df = fetch_monitor_data(cms["url"], session_token)
+
+    # Step 3: Show JSON and Table
+    with st.expander("Raw JSON Response", expanded=False):
+        st.write(df.to_dict(orient="records") if not df.empty else "No data returned.")
+
+    if not df.empty and "error" not in df.columns:
+        st.dataframe(df)
+        # Aggregate summary row
+        online_count = df[df["onlineStatus"].apply(lambda x: isinstance(x, dict) and x.get("name") == "ONLINE")].shape[0]
+        offline_count = df.shape[0] - online_count
+        summary_rows.append({"Agency": cms["name"], "Online": online_count, "Offline": offline_count})
+    else:
+        st.error(f"{cms['url']} - {df.iloc[0]['error'] if not df.empty else 'Unknown error.'}")
+
+# ----------------------------
+# AGGREGATE DASHBOARD
+# ----------------------------
+if summary_rows:
+    st.header("📊 Aggregate Summary")
+    summary_df = pd.DataFrame(summary_rows)
+    st.dataframe(summary_df)
+
+    chart_data = summary_df.melt(id_vars="Agency", value_vars=["Online", "Offline"],
+                                  var_name="Status", value_name="Count")
+
+    chart = alt.Chart(chart_data).mark_bar().encode(
+        x=alt.X("Agency:N", sort=None),
+        y="Count:Q",
+        color="Status:N",
+        column="Status:N"
+    ).properties(height=400)
+
+    st.altair_chart(chart, use_container_width=True)
+
+# ----------------------------
+# FOOTER
+# ----------------------------
+st.markdown("""
+---
+*This dashboard logs in to Papercast CMS instances with your credentials and fetches live display controller or monitor load data using short-lived session tokens.*
+""")
